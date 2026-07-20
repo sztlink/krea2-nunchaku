@@ -25,10 +25,13 @@ from diffusers.models.transformers.transformer_krea2 import (
     Krea2Transformer2DModel,
     Krea2TransformerBlock,
 )
-from huggingface_hub import utils
+from huggingface_hub import hf_hub_download, utils
+from huggingface_hub.errors import EntryNotFoundError
+from safetensors import safe_open
 
+from ...utils import get_precision
 from ..attention import NunchakuBaseAttention
-from ..attention_processors.krea2 import NunchakuKrea2AttnProcessor
+from ..attention_processors.krea2 import Krea2ExpandedHeadsAttnProcessor, NunchakuKrea2AttnProcessor
 from ..linear import SVDQW4A4Linear
 from ..utils import fuse_linears
 from .utils import NunchakuModelLoaderMixin, convert_fp16, patch_scale_key
@@ -87,15 +90,107 @@ class NunchakuKrea2SwiGLU(nn.Module):
         return self.down(F.silu(self.gate(hidden_states)) * self.up(hidden_states))
 
 
+def _splice_bf16_blocks(
+    state_dict: dict[str, torch.Tensor],
+    bf16_blocks: tuple[int, ...],
+    base_model: str,
+    torch_dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Swap the quantized entries of ``bf16_blocks`` for the base model's full-precision weights.
+
+    The quantized checkpoint carries every block, so the entries for blocks that were left
+    unpatched have to be dropped before their full-precision counterparts are loaded in. Only the
+    shards holding the wanted keys are fetched.
+
+    Parameters
+    ----------
+    state_dict : dict of str to torch.Tensor
+        The quantized state dict, covering all blocks.
+    bf16_blocks : tuple of int
+        Indices of the blocks to restore to full precision.
+    base_model : str
+        HuggingFace repo id of the unquantized model.
+    torch_dtype : torch.dtype
+        Dtype to cast the restored weights to.
+
+    Returns
+    -------
+    dict of str to torch.Tensor
+        State dict with the selected blocks at full precision.
+
+    Raises
+    ------
+    KeyError
+        If the base checkpoint carries no weights for a requested block.
+    """
+    prefixes = tuple(f"transformer_blocks.{i}." for i in bf16_blocks)
+    out = {k: v for k, v in state_dict.items() if not k.startswith(prefixes)}
+
+    index_name = "diffusion_pytorch_model.safetensors.index.json"
+    try:
+        index_path = hf_hub_download(base_model, index_name, subfolder="transformer")
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+    except EntryNotFoundError:  # single-file checkpoint, no shard index
+        weight_map = None
+
+    if weight_map is None:
+        shard = hf_hub_download(base_model, "diffusion_pytorch_model.safetensors", subfolder="transformer")
+        shards = {shard: None}
+    else:
+        shards = {}
+        for key, shard_name in weight_map.items():
+            if key.startswith(prefixes):
+                shards.setdefault(shard_name, []).append(key)
+        if not shards:
+            raise KeyError(f"{base_model} carries no weights for blocks {list(bf16_blocks)}")
+
+    restored = 0
+    for shard_name, keys in shards.items():
+        path = shard_name if weight_map is None else hf_hub_download(base_model, shard_name, subfolder="transformer")
+        with safe_open(path, framework="pt") as f:
+            for key in keys if keys is not None else [k for k in f.keys() if k.startswith(prefixes)]:
+                out[key] = f.get_tensor(key).to(torch_dtype)
+                restored += 1
+
+    if restored == 0:
+        raise KeyError(f"{base_model} carries no weights for blocks {list(bf16_blocks)}")
+    print(f"bf16_blocks={list(bf16_blocks)}, restored {restored} full-precision tensors from {base_model}")
+    return out
+
+
 class NunchakuKrea2Transformer2DModel(Krea2Transformer2DModel, NunchakuModelLoaderMixin):
     """Nunchaku-optimized Krea2Transformer2DModel. Inherits the diffusers forward; only the 28 heavy
     blocks' attention and SwiGLU are quantized."""
 
-    def _patch_model(self, **kwargs):
-        for block in self.transformer_blocks:
+    def _patch_model(self, bf16_blocks: tuple[int, ...] = (), **kwargs):
+        """Quantize the transformer blocks, optionally leaving some at full precision.
+
+        Parameters
+        ----------
+        bf16_blocks : tuple of int, optional
+            Indices of blocks to leave unquantized. Calibration error grows roughly 3x from the
+            first block to the last, so spending the bf16 budget on the boundary blocks buys back
+            more fidelity per parameter than spreading it flat. Requires the base model's weights
+            for those blocks, which :meth:`from_pretrained` splices in.
+        **kwargs
+            Forwarded to :class:`SVDQW4A4Linear`.
+        """
+        bf16_blocks = set(bf16_blocks)
+        n = len(self.transformer_blocks)
+        if any(i < 0 or i >= n for i in bf16_blocks):
+            raise ValueError(f"bf16_blocks out of range for {n} blocks: {sorted(bf16_blocks)}")
+        for i, block in enumerate(self.transformer_blocks):
             assert isinstance(block, Krea2TransformerBlock)
+            if i in bf16_blocks:
+                # Keep the weights at full precision but still expand the grouped-query heads.
+                # The stock processor passes enable_gqa=True, which loses FlashAttention whenever a
+                # mask is present, and Krea 2 always passes one.
+                block.attn.processor = Krea2ExpandedHeadsAttnProcessor()
+                continue
             block.attn = NunchakuKrea2Attention(block.attn, **kwargs)
             block.ff = NunchakuKrea2SwiGLU(block.ff, **kwargs)
+        self.bf16_blocks = sorted(bf16_blocks)
         return self
 
     @classmethod
@@ -118,16 +213,30 @@ class NunchakuKrea2Transformer2DModel(Krea2Transformer2DModel, NunchakuModelLoad
             (".safetensors", ".sft")
         ), "Only safetensors are supported"
 
+        bf16_blocks = tuple(kwargs.pop("bf16_blocks", ()) or ())
+        base_model = kwargs.pop("base_model", "krea/Krea-2-Turbo")
+
         transformer, model_state_dict, metadata = cls._build_model(pretrained_model_name_or_path, **kwargs)
         quantization_config = json.loads(metadata.get("quantization_config", "{}"))
         rank = quantization_config.get("rank", 32)
-        precision = quantization_config.get("precision", "int4")
         transformer = transformer.to(torch_dtype)
+
+        # Metadata is authoritative when the converter wrote it; otherwise fall back to the
+        # hardware default, as the other ports do. Silently defaulting to int4 would load an
+        # nvfp4 checkpoint with the wrong kernels on Blackwell.
+        precision = quantization_config.get("precision")
+        if precision is None:
+            precision = get_precision()
+        if precision == "fp4":
+            precision = "nvfp4"
 
         print(f"quantization_config: {quantization_config}, rank={rank}, precision={precision}")
 
-        transformer._patch_model(precision=precision, rank=rank)
+        transformer._patch_model(precision=precision, rank=rank, bf16_blocks=bf16_blocks)
         transformer = transformer.to_empty(device=device)
+
+        if bf16_blocks:
+            model_state_dict = _splice_bf16_blocks(model_state_dict, bf16_blocks, base_model, torch_dtype)
 
         patch_scale_key(transformer, model_state_dict)
         if torch_dtype == torch.float16:
