@@ -4,6 +4,9 @@ Krea 2 Turbo running on **4-bit weights and 4-bit activations** through Nunchaku
 low-bit kernels. This is the runtime port plus the deepcompressor conversion path, which is
 everything you need to reproduce the build or run the checkpoint.
 
+> The runtime port is [under review upstream](https://github.com/nunchaku-ai/nunchaku/pull/947).
+> If it lands, install Nunchaku normally and skip the patching step below.
+
 The checkpoint is at
 [felipesztutman/Krea-2-Turbo-W4A4-Nunchaku](https://huggingface.co/felipesztutman/Krea-2-Turbo-W4A4-Nunchaku).
 The fidelity and latency numbers, and the raw per-pair data behind them, are in
@@ -50,7 +53,8 @@ from diffusers import Krea2Pipeline
 import torch
 
 transformer = NunchakuKrea2Transformer2DModel.from_pretrained(
-    "felipesztutman/Krea-2-Turbo-W4A4-Nunchaku", torch_dtype=torch.bfloat16,
+    "felipesztutman/Krea-2-Turbo-W4A4-Nunchaku/svdq-int4_r32-krea-2-turbo.safetensors",
+    torch_dtype=torch.bfloat16,
 )
 pipe = Krea2Pipeline.from_pretrained(
     "krea/Krea-2-Turbo", transformer=transformer, torch_dtype=torch.bfloat16,
