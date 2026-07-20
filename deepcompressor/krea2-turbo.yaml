@@ -1,0 +1,66 @@
+pipeline:
+  name: krea2-turbo
+  path: krea/Krea-2-Turbo
+  dtype: torch.bfloat16
+eval:
+  # Krea 2 Turbo is a few-step (TDM) distilled checkpoint: 8 steps, no CFG
+  # (in `Krea2Pipeline`, `guidance_scale > 0` enables classifier-free guidance,
+  # so the cfg-distilled Turbo checkpoint runs with `guidance_scale: 0.0`)
+  num_steps: 8
+  guidance_scale: 0.0
+  protocol: fmeuler{num_steps}-g{guidance_scale}
+quant:
+  calib:
+    path: datasets/{dtype}/{model}/{protocol}/{data}/s48
+    num_samples: 128
+    batch_size: 8
+  wgts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 16
+      element_size: 512
+      sample_size: -1
+    low_rank:
+      sample_batch_size: 16
+      sample_size: -1
+    skips:
+    - embed
+    - resblock_shortcut
+    - resblock_time_proj
+    - transformer_proj_in
+    - transformer_proj_out
+    - transformer_norm
+    - transformer_add_norm
+    - down_sample
+    - up_sample
+  ipts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 16
+      element_size: 512
+      sample_size: -1
+    skips:
+    - embed
+    - resblock_shortcut
+    - resblock_time_proj
+    - transformer_proj_in
+    - transformer_proj_out
+    - transformer_norm
+    - transformer_add_norm
+    - down_sample
+    - up_sample
+  opts:
+    calib_range:
+      element_batch_size: 64
+      sample_batch_size: 16
+      element_size: 512
+      sample_size: -1
+  smooth:
+    proj:
+      element_batch_size: 32
+      sample_batch_size: 4
+      element_size: -1
+      sample_size: -1
+    attn:
+      sample_batch_size: 4
+      sample_size: -1
