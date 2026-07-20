@@ -64,8 +64,10 @@ pipe = Krea2Pipeline.from_pretrained(
 image = pipe("a fox in the snow", guidance_scale=0.0, num_inference_steps=8).images[0]
 ```
 
-Ada or newer (4090, L40S, L4). The fused W4A4 kernels need INT4 tensor cores, so this will
-not run on Ampere.
+Ampere or newer. Verified on an RTX 3090 (sm_86): 2.66s at 512px/8 steps, 9.37s at 1024px/8
+steps, 0.83s at 512px/2 steps, all warm medians. Also runs on Ada (4090, L40S, L4). Nunchaku
+reports INT4 support down to Turing (20-series) since v1.2.0, which I have not tested here. The
+NVFP4 variant is the one that needs Blackwell; this INT4 build does not.
 
 ## Two things that cost me time
 
