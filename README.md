@@ -30,7 +30,22 @@ pure Python against them.
 
 ## Install
 
-These files patch into installed copies of Nunchaku and deepcompressor.
+Pin Nunchaku to a wheel that carries the `convert_fp16` loader this runtime imports. **1.2.1 is
+the tested version.** Earlier wheels (1.1.0 and below) predate that symbol and fail on import,
+and not every nightly ships a Windows build. Verified end to end on two setups:
+
+| OS | GPU | wheel |
+|---|---|---|
+| Linux | Ada (L40S) | `nunchaku==1.2.1+cu12.8torch2.8` cp312 |
+| Windows 11 | Ampere (RTX 3090) | `nunchaku-1.2.1+cu12.8torch2.8-cp312-cp312-win_amd64` |
+
+```bash
+pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+pip install "https://github.com/nunchaku-tech/nunchaku/releases/download/v1.2.1/nunchaku-1.2.1+cu12.8torch2.8-cp312-cp312-linux_x86_64.whl"
+pip install "diffusers>=0.36" transformers accelerate safetensors einops "peft>=0.17"
+```
+
+Then patch these files into the installed Nunchaku:
 
 ```bash
 git clone https://github.com/sztlink/krea2-nunchaku && cd krea2-nunchaku
@@ -64,10 +79,10 @@ pipe = Krea2Pipeline.from_pretrained(
 image = pipe("a fox in the snow", guidance_scale=0.0, num_inference_steps=8).images[0]
 ```
 
-Ampere or newer. Verified on an RTX 3090 (sm_86): 2.66s at 512px/8 steps, 9.37s at 1024px/8
-steps, 0.83s at 512px/2 steps, all warm medians. Also runs on Ada (4090, L40S, L4). Nunchaku
-reports INT4 support down to Turing (20-series) since v1.2.0, which I have not tested here. The
-NVFP4 variant is the one that needs Blackwell; this INT4 build does not.
+Ampere or newer. Verified on an RTX 3090 (sm_86), both Linux and native Windows 11: 2.7s at
+512px/8 steps, 9.5s at 1024px/8 steps, 0.85s at 512px/2 steps, warm. Also runs on Ada (L40S).
+Nunchaku reports INT4 support down to Turing (20-series) since v1.2.0, untested here. The NVFP4
+variant is the one that needs Blackwell; this INT4 build does not.
 
 ## Two things that cost me time
 
